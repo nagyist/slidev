@@ -1,66 +1,20 @@
-import { join } from 'node:path'
-import { createRequire } from 'node:module'
+import type { ResolvedFontOptions, SourceSlideInfo } from '@slidev/types'
+import type MarkdownIt from 'markdown-it'
+import type { Connect } from 'vite'
 import { fileURLToPath } from 'node:url'
-import { ensurePrefix, slash } from '@antfu/utils'
-import isInstalledGlobally from 'is-installed-globally'
-import { resolvePath } from 'mlly'
-import globalDirs from 'global-directory'
-import type Token from 'markdown-it/lib/token'
-import type { ResolvedFontOptions } from '@slidev/types'
+import { createJiti } from 'jiti'
+import YAML from 'yaml'
 
-const require = createRequire(import.meta.url)
+type Token = ReturnType<MarkdownIt['parseInline']>[number]
 
-export function toAtFS(path: string) {
-  return `/@fs${ensurePrefix('/', slash(path))}`
-}
-
-export async function resolveImportPath(importName: string, ensure: true): Promise<string>
-export async function resolveImportPath(importName: string, ensure?: boolean): Promise<string | undefined>
-export async function resolveImportPath(importName: string, ensure = false) {
-  try {
-    return resolvePath(importName, {
-      url: fileURLToPath(import.meta.url),
-    })
-  }
-  catch {}
-
-  if (isInstalledGlobally) {
-    try {
-      return require.resolve(join(globalDirs.yarn.packages, importName))
-    }
-    catch {}
-
-    try {
-      return require.resolve(join(globalDirs.npm.packages, importName))
-    }
-    catch {}
-  }
-
-  if (ensure)
-    throw new Error(`Failed to resolve package "${importName}"`)
-
-  return undefined
-}
-
-export async function resolveGlobalImportPath(importName: string): Promise<string> {
-  try {
-    return resolvePath(importName, {
-      url: fileURLToPath(import.meta.url),
-    })
-  }
-  catch {}
-
-  try {
-    return require.resolve(join(globalDirs.yarn.packages, importName))
-  }
-  catch {}
-
-  try {
-    return require.resolve(join(globalDirs.npm.packages, importName))
-  }
-  catch {}
-
-  throw new Error(`Failed to resolve global package "${importName}"`)
+type Jiti = ReturnType<typeof createJiti>
+let jiti: Jiti | undefined
+export function loadModule<T = unknown>(absolutePath: string): Promise<T> {
+  jiti ??= createJiti(fileURLToPath(import.meta.url), {
+    // Allows changes to take effect
+    moduleCache: false,
+  })
+  return jiti.import(absolutePath) as Promise<T>
 }
 
 export function stringifyMarkdownTokens(tokens: Token[]) {
@@ -72,20 +26,74 @@ export function stringifyMarkdownTokens(tokens: Token[]) {
     .join(' ')
 }
 
-export function generateGoogleFontsUrl(options: ResolvedFontOptions) {
+export function generateFontParams(options: ResolvedFontOptions) {
   const weights = options.weights
     .flatMap(i => options.italic ? [`0,${i}`, `1,${i}`] : [`${i}`])
     .sort()
     .join(';')
-  const fonts = options.webfonts
+  const fontParams = options.webfonts
     .map(i => `family=${i.replace(/^(['"])(.*)\1$/, '$1').replace(/\s+/g, '+')}:${options.italic ? 'ital,' : ''}wght@${weights}`)
     .join('&')
-
-  return `https://fonts.googleapis.com/css2?${fonts}&display=swap`
+  return fontParams
 }
 
-export async function packageExists(name: string) {
-  if (await resolveImportPath(`${name}/package.json`))
-    return true
-  return false
+export function generateGoogleFontsUrl(options: ResolvedFontOptions) {
+  return `https://fonts.googleapis.com/css2?${generateFontParams(options)}&display=swap`
+}
+
+export function generateCoollabsFontsUrl(options: ResolvedFontOptions) {
+  return `https://api.fonts.coollabs.io/fonts?${generateFontParams(options)}&display=swap`
+}
+
+/**
+ * Update frontmatter patch and preserve the comments
+ */
+export function updateFrontmatterPatch(source: SourceSlideInfo, frontmatter: Record<string, any>) {
+  let doc = source.frontmatterDoc
+  if (!doc) {
+    source.frontmatterStyle = 'frontmatter'
+    source.frontmatterDoc = doc = new YAML.Document({})
+  }
+  for (const [key, value] of Object.entries(frontmatter)) {
+    source.frontmatter[key] = value
+    if (value == null) {
+      doc.delete(key)
+    }
+    else {
+      const valueNode = doc.createNode(value)
+      let found = false
+      YAML.visit(doc.contents, {
+        Pair(_key, node, path) {
+          if (path.length === 1 && YAML.isScalar(node.key) && node.key.value === key) {
+            node.value = valueNode
+            found = true
+            return YAML.visit.BREAK
+          }
+        },
+      })
+      if (!found) {
+        if (!YAML.isMap(doc.contents))
+          doc.contents = doc.createNode({})
+        doc.contents.add(
+          doc.createPair(key, valueNode),
+        )
+      }
+    }
+  }
+}
+
+export function getBodyJson(req: Connect.IncomingMessage) {
+  return new Promise<any>((resolve, reject) => {
+    let body = ''
+    req.on('data', chunk => body += chunk)
+    req.on('error', reject)
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body) || {})
+      }
+      catch (e) {
+        reject(e)
+      }
+    })
+  })
 }
